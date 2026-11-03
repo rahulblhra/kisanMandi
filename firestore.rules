@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Auth and staff account data are accessed only by trusted Cloud Functions.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
