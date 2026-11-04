@@ -127,6 +127,8 @@ export interface AuditLog {
   entityId: string
   action: 'CREATE' | 'UPDATE' | 'VOID'
   timestamp: string
+  actorEmail?: string
+  actorProfile?: string
   details: Record<string, unknown>
 }
 

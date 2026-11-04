@@ -3,6 +3,7 @@ import type { AppSettings, AuditLog, Buyer, BuyerPayment, Crop, Expense, Kisan, 
 type DriveFile = { id: string; name: string; mimeType: string }
 type MasterData = { kisans: Kisan[]; buyers: Buyer[]; crops: Crop[]; varieties: Variety[]; seasons: Season[]; summaryFilesVersion?: number; settings: AppSettings | null; auditLogs: AuditLog[] }
 type SeasonData = { transactions: Transaction[]; expenses: Expense[]; buyerPayments: BuyerPayment[]; kisanPayments: KisanPayment[] }
+export type BackupStatus = { name: string; createdAt: string; backupType: 'DAILY' | 'MANUAL'; fileCount: number }
 const emptyMaster = (): MasterData => ({ kisans: [], buyers: [], crops: [], varieties: [], seasons: [], settings: null, auditLogs: [] })
 const jsonMime = 'application/json'
 
@@ -15,12 +16,21 @@ export class DriveRepository {
 
   constructor(private readonly accessToken: string) {}
 
+  private clearLookupCaches(): void { this.folderCache.clear(); this.fileCache.clear(); this.childrenCache.clear() }
+
   private async request<T>(url: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(url, { ...init, headers: { Authorization: `Bearer ${this.accessToken}`, ...init.headers } })
+    let response: Response
+    try { response = await fetch(url, { ...init, headers: { Authorization: `Bearer ${this.accessToken}`, ...init.headers } }) }
+    catch { this.clearLookupCaches(); throw new Error('Could not connect to Google Drive. Check your internet connection and retry; your form values are still here.') }
     if (!response.ok) {
       const payload = await response.json().catch(() => null) as { error?: { message?: string } } | null
       if (response.status === 401) throw new Error('Google Drive sign-in expired. Reconnect Google to retry this save; your form data is still here.')
-      throw new Error(payload?.error?.message || `Google Drive request failed (${response.status}).`)
+      const detail = payload?.error?.message
+      if (response.status === 403) throw new Error(detail ? `Google Drive denied this request: ${detail}. Check that you signed into the correct account and can access the KisanMandi folder.` : 'Google Drive denied access. Check your account permissions and reconnect Google.')
+      if (response.status === 404) { this.clearLookupCaches(); throw new Error('A Google Drive file or folder could not be found. Refresh the page and retry; your form values are still here.') }
+      if (response.status === 429) { this.clearLookupCaches(); throw new Error('Google Drive is receiving too many requests right now. Wait a moment, then retry; your form values are still here.') }
+      if (response.status >= 500) { this.clearLookupCaches(); throw new Error('Google Drive is temporarily unavailable. Wait a moment, then retry; your form values are still here.') }
+      throw new Error(detail || `Google Drive request failed (${response.status}). Your form values are still here.`)
     }
     if (response.status === 204) return undefined as T
     const body = await response.text()
@@ -89,9 +99,15 @@ export class DriveRepository {
   private async readJson<T>(parentId: string, name: string, fallback: T): Promise<T> {
     const id = await this.fileId(parentId, name)
     if (!id) return fallback
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, { headers: { Authorization: `Bearer ${this.accessToken}` } })
+    let response: Response
+    try { response = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, { headers: { Authorization: `Bearer ${this.accessToken}` } }) }
+    catch { throw new Error(`Could not connect to Google Drive while reading ${name}. Check your internet connection and retry.`) }
     if (!response.ok) {
       if (response.status === 401) throw new Error('Google Drive sign-in expired. Reconnect Google to retry this save; your form data is still here.')
+      if (response.status === 403) throw new Error(`Google Drive denied access to ${name}. Check that you signed into the correct account and can access the KisanMandi folder.`)
+      if (response.status === 404) { this.clearLookupCaches(); throw new Error(`${name} could not be found in Google Drive. Refresh the page and retry.`) }
+      if (response.status === 429) throw new Error('Google Drive is receiving too many requests right now. Wait a moment, then retry.')
+      if (response.status >= 500) throw new Error('Google Drive is temporarily unavailable. Wait a moment, then retry.')
       throw new Error(`Could not read ${name} from Google Drive (${response.status}).`)
     }
     try { return await response.json() as T } catch { throw new Error(`The Drive file ${name} is not valid JSON. Restore it from a backup before editing.`) }
@@ -119,6 +135,27 @@ export class DriveRepository {
     const created = await this.createBackupSnapshot(name, 'MANUAL')
     if (!created) throw new Error('There is no KisanMandi data to back up yet.')
     return created
+  }
+
+  async getLatestBackupStatus(): Promise<BackupStatus | null> {
+    const roots = await this.listChildren(undefined, 'KisanMandi Backups')
+    const backupsFolder = roots.find((item) => item.name === 'KisanMandi Backups' && item.mimeType === 'application/vnd.google-apps.folder')
+    if (!backupsFolder) return null
+    const candidates = (await this.listChildren(backupsFolder.id))
+      .filter((item) => item.mimeType === 'application/vnd.google-apps.folder' && /^(?:MANUAL-)?\d{4}-\d{2}-\d{2}/.test(item.name))
+      .map((item) => ({ item, date: /^(?:MANUAL-)?(\d{4}-\d{2}-\d{2})/.exec(item.name)?.[1] ?? '' }))
+      .sort((a, b) => b.date.localeCompare(a.date) || b.item.name.localeCompare(a.item.name))
+    if (!candidates.length) return null
+    const dates = [...new Set(candidates.map((candidate) => candidate.date))]
+    for (const date of dates) {
+      const manifests = await Promise.all(candidates.filter((candidate) => candidate.date === date).map(async ({ item }) => ({
+        item,
+        manifest: await this.readJson<{ createdAt?: string; backupType?: 'DAILY' | 'MANUAL'; fileCount?: number } | null>(item.id, 'manifest.json', null),
+      })))
+      const latest = manifests.filter((row) => row.manifest?.createdAt).sort((a, b) => (b.manifest?.createdAt ?? '').localeCompare(a.manifest?.createdAt ?? ''))[0]
+      if (latest?.manifest?.createdAt) return { name: latest.item.name, createdAt: latest.manifest.createdAt, backupType: latest.manifest.backupType ?? (latest.item.name.startsWith('MANUAL-') ? 'MANUAL' : 'DAILY'), fileCount: latest.manifest.fileCount ?? 0 }
+    }
+    return null
   }
 
   private async createBackupSnapshot(name: string, backupType: 'DAILY' | 'MANUAL'): Promise<string | null> {
